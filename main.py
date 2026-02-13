@@ -29,6 +29,12 @@ def main() -> None:
     parser.add_argument("--llm_base_url", type=str, default=DEFAULT_LLM_BASE_URL, help="LLM base URL")
     parser.add_argument("--llm_name", type=str, default=DEFAULT_LLM_NAME, help="LLM model name")
     parser.add_argument("--embedding_name", type=str, default=DEFAULT_EMB_NAME, help="Embedding model name")
+    parser.add_argument(
+        "--embedding_query_instruction",
+        type=str,
+        default=None,
+        help="Optional query instruction for instruction-tuned embedders (e.g., NV-Embed-v2).",
+    )
     parser.add_argument("--save_root", type=str, default="outputs", help="Save root directory")
     parser.add_argument("--force_index_from_scratch", type=str, default="false", help="Rebuild offline index")
     # Offline tuning knobs (engineering-grade reproducibility)
@@ -81,6 +87,8 @@ def main() -> None:
         embedding_model_name=args.embedding_name,
         force_index_from_scratch=_parse_bool(args.force_index_from_scratch),
     )
+    if args.embedding_query_instruction is not None:
+        cfg.embedding_query_instruction = str(args.embedding_query_instruction)
     if args.capsule_mode is not None:
         cfg.capsule_mode = str(args.capsule_mode).strip()
     if args.chunk_tokens is not None:
