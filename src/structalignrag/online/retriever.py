@@ -296,7 +296,7 @@ class StructAlignRetriever:
         # Embed once per query (question + all subQs) for speed and to avoid repeated GPU calls.
         # This does not change embeddings (same model, same texts), only reduces overhead.
         texts_to_embed = [question] + [str((n or {}).get("question") or question) for n in nodes]
-        q_subq_emb = embedder.encode(texts_to_embed)
+        q_subq_emb = embedder.encode(texts_to_embed, instruction=str(getattr(self.config, "embedding_query_instruction", "") or ""))
         q_emb = q_subq_emb[0]
         subq_emb_rows = q_subq_emb[1:]
         p_sims = passage_emb @ q_emb

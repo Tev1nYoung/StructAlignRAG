@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 from tqdm import tqdm
 
 from .config import DEFAULT_LLM_BASE_URL, StructAlignRAGConfig
-from .embed.contriever import ContrieverEmbedder
+from .embed.factory import build_embedder
 from .llm.openai_compat import CacheOpenAICompat, maybe_set_llm_key_from_file
 from .metrics.metrics import extra_metrics, qa_em_f1, retrieval_recall
 from .offline.indexer import OfflineIndexer
@@ -80,7 +80,7 @@ class StructAlignRAG:
         )
 
         # Models
-        self.embedder = ContrieverEmbedder(
+        self.embedder = build_embedder(
             model_name=config.embedding_model_name,
             batch_size=config.embedding_batch_size,
             max_length=config.embedding_max_seq_len,

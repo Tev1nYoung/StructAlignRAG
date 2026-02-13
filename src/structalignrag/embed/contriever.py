@@ -81,7 +81,9 @@ class ContrieverEmbedder:
             emb = _mean_pooling(outputs[0], inputs["attention_mask"])
         return emb
 
-    def encode(self, texts: List[str]) -> np.ndarray:
+    def encode(self, texts: List[str], instruction: str = "") -> np.ndarray:
+        # `instruction` is accepted for API compatibility with instruction-tuned embedders (e.g., NV-Embed-v2),
+        # but Contriever-style encoders do not use it.
         if isinstance(texts, str):
             texts = [texts]
         if not texts:

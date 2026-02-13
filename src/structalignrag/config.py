@@ -25,6 +25,8 @@ class StructAlignRAGConfig:
     embedding_max_seq_len: int = 512
     embedding_return_normalized: bool = True
     embedding_dtype: str = "auto"
+    # For instruction-tuned embedders (e.g., NV-Embed-v2). Ignored by plain encoders like Contriever.
+    embedding_query_instruction: str = "Given a question, retrieve relevant documents that best answer the question."
 
     # Offline
     force_index_from_scratch: bool = False
