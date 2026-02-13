@@ -34,6 +34,9 @@ class StructAlignRAGConfig:
     capsule_mode: str = "llm"  # llm|sentence
     max_capsules_per_passage: int = 6
     offline_llm_workers: int = 8
+    # Online QA: parallelize across queries (safe; does not change ranking/logic).
+    # 0 means "auto" (pick a conservative default based on available API keys).
+    online_qa_workers: int = 0
 
     # Canonicalization
     enable_entity_canonicalization: bool = True
@@ -50,6 +53,7 @@ class StructAlignRAGConfig:
     enable_nli_edges: bool = False
     nli_max_pairs: int = 2000
     nli_min_sim: float = 0.9
+    nli_llm_workers: int = 1
 
     # Online: query decomposition
     enable_query_dag: bool = True

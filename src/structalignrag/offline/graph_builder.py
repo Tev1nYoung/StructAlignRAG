@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Set, Tuple
 
 import faiss
@@ -106,28 +107,23 @@ def _build_nli_edges(
         "Output strict JSON only. Be conservative: if unsure, output neutral."
     )
 
-    out: List[EdgeRow] = []
-    pbar = tqdm(pairs, desc="NLI Edges", disable=False, ascii=True, dynamic_ncols=True)
-    for sim, i, j in pbar:
+    def _classify_one(sim: float, i: int, j: int) -> EdgeRow | None:
         a = texts[i]
         b = texts[j]
         if not a or not b:
-            continue
+            return None
         if a == b:
             # Equivalent statements by string identity: add an entail edge without LLM.
-            out.append(
-                {
-                    "src": f"C:{canonical_capsules[i]['canonical_id']}",
-                    "dst": f"C:{canonical_capsules[j]['canonical_id']}",
-                    "type": "entails",
-                    "weight": 0.1,
-                    "sim": float(sim),
-                    "label": "equivalent",
-                    "confidence": 1.0,
-                    "cache_hit": True,
-                }
-            )
-            continue
+            return {
+                "src": f"C:{canonical_capsules[i]['canonical_id']}",
+                "dst": f"C:{canonical_capsules[j]['canonical_id']}",
+                "type": "entails",
+                "weight": 0.1,
+                "sim": float(sim),
+                "label": "equivalent",
+                "confidence": 1.0,
+                "cache_hit": True,
+            }
 
         user = (
             f"Statement A:\n{a}\n\n"
@@ -166,24 +162,44 @@ def _build_nli_edges(
             cache_hit = False
 
         if label == "neutral":
-            continue
+            return None
 
         typ = "contradicts" if label == "contradicts" else "entails"
         w = 1.0 if typ == "contradicts" else 0.2
 
-        out.append(
-            {
-                "src": f"C:{canonical_capsules[i]['canonical_id']}",
-                "dst": f"C:{canonical_capsules[j]['canonical_id']}",
-                "type": typ,
-                "weight": float(w),
-                "sim": float(sim),
-                "label": label,
-                "confidence": float(conf_f),
-                "cache_hit": cache_hit,
-            }
-        )
+        return {
+            "src": f"C:{canonical_capsules[i]['canonical_id']}",
+            "dst": f"C:{canonical_capsules[j]['canonical_id']}",
+            "type": typ,
+            "weight": float(w),
+            "sim": float(sim),
+            "label": label,
+            "confidence": float(conf_f),
+            "cache_hit": cache_hit,
+        }
 
+    out: List[EdgeRow] = []
+    workers = max(1, int(getattr(config, "nli_llm_workers", 1) or 1))
+    if workers <= 1 or len(pairs) <= 1:
+        pbar = tqdm(pairs, desc="NLI Edges", disable=False, ascii=True, dynamic_ncols=True)
+        for sim, i, j in pbar:
+            row = _classify_one(sim=sim, i=i, j=j)
+            if row:
+                out.append(row)
+        return out
+
+    pbar = tqdm(total=len(pairs), desc="NLI Edges", disable=False, ascii=True, dynamic_ncols=True)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_classify_one, sim, i, j): (i, j) for sim, i, j in pairs}
+        for fut in as_completed(futs):
+            row = fut.result()
+            if row:
+                out.append(row)
+            pbar.update(1)
+    pbar.close()
+
+    # Deterministic ordering.
+    out.sort(key=lambda r: (str(r.get("src")), str(r.get("dst")), str(r.get("type"))))
     return out
 
 

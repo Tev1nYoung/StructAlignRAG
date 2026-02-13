@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import List, Optional
 
 import numpy as np
@@ -32,6 +33,9 @@ class ContrieverEmbedder:
         self.max_length = max_length
         self.normalize = normalize
         self.dtype = dtype
+        # HuggingFace tokenizer/model are not guaranteed to be thread-safe for concurrent forward passes.
+        # We allow higher-level pipeline parallelism (LLM I/O, multi-query) while serializing GPU encoder calls.
+        self._encode_lock = threading.Lock()
 
         logger.info(f"[StructAlignRAG] loading embedding model | name={self.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
@@ -83,21 +87,22 @@ class ContrieverEmbedder:
         if not texts:
             return np.zeros((0, 1), dtype=np.float32)
 
-        results: List[torch.Tensor] = []
-        if len(texts) <= self.batch_size:
-            results.append(self._encode_batch(texts))
-        else:
-            # On some Windows terminals, tqdm's unicode blocks render as garbled characters.
-            # Use ASCII progress bars for stable real-time visibility.
-            pbar = tqdm(total=len(texts), desc="Batch Encoding", ascii=True, dynamic_ncols=True)
-            for i in range(0, len(texts), self.batch_size):
-                batch = texts[i : i + self.batch_size]
-                results.append(self._encode_batch(batch))
-                pbar.update(len(batch))
-            pbar.close()
+        with self._encode_lock:
+            results: List[torch.Tensor] = []
+            if len(texts) <= self.batch_size:
+                results.append(self._encode_batch(texts))
+            else:
+                # On some Windows terminals, tqdm's unicode blocks render as garbled characters.
+                # Use ASCII progress bars for stable real-time visibility.
+                pbar = tqdm(total=len(texts), desc="Batch Encoding", ascii=True, dynamic_ncols=True)
+                for i in range(0, len(texts), self.batch_size):
+                    batch = texts[i : i + self.batch_size]
+                    results.append(self._encode_batch(batch))
+                    pbar.update(len(batch))
+                pbar.close()
 
-        emb = torch.cat(results, dim=0)
-        emb = emb.detach().float().cpu().numpy()
+            emb = torch.cat(results, dim=0)
+            emb = emb.detach().float().cpu().numpy()
 
         if self.normalize and len(emb) > 0:
             norms = np.linalg.norm(emb, axis=1, keepdims=True)

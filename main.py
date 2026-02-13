@@ -36,7 +36,9 @@ def main() -> None:
     parser.add_argument("--chunk_tokens", type=int, default=None, help="Passage chunk token budget (default from config)")
     parser.add_argument("--chunk_overlap", type=int, default=None, help="Chunk overlap tokens (default from config)")
     parser.add_argument("--offline_llm_workers", type=int, default=None, help="Offline LLM parallel workers")
+    parser.add_argument("--online_qa_workers", type=int, default=None, help="Online QA parallel workers (per-query)")
     parser.add_argument("--enable_nli_edges", type=str, default=None, help="Enable cached NLI edges: true|false")
+    parser.add_argument("--nli_llm_workers", type=int, default=None, help="Offline NLI LLM workers (if enabled)")
     parser.add_argument("--offline_store_llm_meta", type=str, default=None, help="Store per-call llm_meta into capsules: true|false")
     # Online ablations (for paper-quality experiments)
     parser.add_argument("--enable_llm_doc_rerank", type=str, default=None, help="Enable LLM doc rerank: true|false")
@@ -87,8 +89,12 @@ def main() -> None:
         cfg.chunk_overlap = int(args.chunk_overlap)
     if args.offline_llm_workers is not None:
         cfg.offline_llm_workers = int(args.offline_llm_workers)
+    if args.online_qa_workers is not None:
+        cfg.online_qa_workers = int(args.online_qa_workers)
     if args.enable_nli_edges is not None:
         cfg.enable_nli_edges = _parse_bool(args.enable_nli_edges)
+    if args.nli_llm_workers is not None:
+        cfg.nli_llm_workers = int(args.nli_llm_workers)
     if args.offline_store_llm_meta is not None:
         cfg.offline_store_llm_meta = _parse_bool(args.offline_store_llm_meta)
     if args.enable_llm_doc_rerank is not None:
@@ -104,11 +110,20 @@ def main() -> None:
 
     t0 = time.time()
     rag = StructAlignRAG(cfg)
+    t1 = time.time()
     rag.index(corpus)
-    metrics = rag.rag_qa(queries=queries, gold_docs=gold_docs, gold_answers=gold_answers, qids=qids)
+    t2 = time.time()
+    metrics = rag.rag_qa(
+        queries=queries,
+        gold_docs=gold_docs,
+        gold_answers=gold_answers,
+        qids=qids,
+        run_timing_s={"init": float(t1 - t0), "index": float(t2 - t1)},
+    )
+    t3 = time.time()
 
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
-    print(f"[main] total_elapsed={time.time()-t0:.2f}s")
+    print(f"[main] total_elapsed={t3-t0:.2f}s")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
@@ -120,62 +121,145 @@ class StructAlignRAG:
         gold_docs: Optional[Sequence[Sequence[str]]],
         gold_answers: Sequence[Set[str]],
         qids: Optional[Sequence[str]] = None,
+        run_timing_s: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
+        t_qa0 = time.time()
         index = self.indexer.load_index()
-
-        preds: List[Dict[str, Any]] = []
-        predicted_answers: List[str] = []
-        retrieved_docs_all: List[List[str]] = []
-        subq_cov_list: List[float] = []
-        ev_tokens_list: List[int] = []
-        latency_list: List[float] = []
 
         if qids is None:
             qids = [str(i) for i in range(len(queries))]
 
-        logger.info(f"[StructAlignRAG] [RAG_QA] start | num_queries={len(queries)}")
-        pbar = tqdm(list(zip(qids, queries, gold_answers)), desc="RAG_QA", disable=False, ascii=True, dynamic_ncols=True)
-        for qid, q, _gold in pbar:
+        n = len(queries)
+        preds: List[Optional[Dict[str, Any]]] = [None for _ in range(n)]
+        predicted_answers: List[Optional[str]] = [None for _ in range(n)]
+        retrieved_docs_all: List[Optional[List[str]]] = [None for _ in range(n)]
+        subq_cov_list: List[float] = [0.0 for _ in range(n)]
+        ev_tokens_list: List[int] = [0 for _ in range(n)]
+        latency_list: List[float] = [0.0 for _ in range(n)]
+
+        # Online parallelism:
+        # - We parallelize per-query (I/O bound on LLM).
+        # - Embedding calls are serialized inside the embedder (thread-safe lock),
+        #   so this does not change retrieval logic or introduce nondeterminism from concurrent GPU calls.
+        workers = int(getattr(self.config, "online_qa_workers", 0) or 0)
+        if workers <= 0:
+            # Conservative auto: use up to num_keys, but cap to 8 to avoid 429 storms on some providers.
+            try:
+                workers = min(8, max(1, int(getattr(self.llm, "num_keys")() or 1)))
+            except Exception:
+                workers = 1
+
+        logger.info(f"[StructAlignRAG] [RAG_QA] start | num_queries={n} workers={workers}")
+
+        def _run_one(i: int, qid: str, q: str) -> Dict[str, Any]:
             qt0 = time.time()
-            logger.info(f"[StructAlignRAG] [Step 1-5] query start | {q}")
+            logger.info(f"[StructAlignRAG] [Step 1-5] query start | qid={qid} | {q}")
 
             dag = build_query_dag(q, llm=self.llm, config=self.config)
             rr = self.retriever.retrieve(question=q, query_dag=dag, index=index, embedder=self.embedder, llm=self.llm)
             ans, gen_meta = self.generator.answer(question=q, passages=rr.selected_passages)
 
-            predicted_answers.append(ans)
-            retrieved_docs_all.append(rr.retrieved_docs)
-            subq_cov_list.append(float(rr.debug.get("subq_coverage", 0.0)))
-            ev_tokens_list.append(int(rr.debug.get("evidence_tokens", 0)))
-            latency_list.append(float(time.time() - qt0))
+            return {
+                "i": i,
+                "qid": qid,
+                "question": q,
+                "answer": ans,
+                "query_dag": dag,
+                "selected_passages": [{"doc_idx": p.get("doc_idx"), "title": p.get("title")} for p in rr.selected_passages],
+                "retrieved_docs": rr.retrieved_docs,
+                "debug": rr.debug,
+                "gen_meta": gen_meta,
+                "latency_s": float(time.time() - qt0),
+            }
 
-            preds.append(
-                {
-                    "qid": qid,
-                    "question": q,
-                    "answer": ans,
-                    "query_dag": dag,
-                    "selected_passages": [
-                        {"doc_idx": p.get("doc_idx"), "title": p.get("title")} for p in rr.selected_passages
-                    ],
-                    "retrieved_docs_top5": rr.retrieved_docs[:5],
-                    "debug": rr.debug,
-                    "gen_meta": gen_meta,
+        if workers <= 1 or n <= 1:
+            pbar = tqdm(total=n, desc="RAG_QA", disable=False, ascii=True, dynamic_ncols=True)
+            for i, (qid, q) in enumerate(zip(qids, queries)):
+                out = _run_one(i=i, qid=qid, q=q)
+                predicted_answers[i] = out["answer"]
+                retrieved_docs_all[i] = list(out["retrieved_docs"] or [])
+                subq_cov_list[i] = float((out.get("debug") or {}).get("subq_coverage", 0.0))
+                ev_tokens_list[i] = int((out.get("debug") or {}).get("evidence_tokens", 0))
+                latency_list[i] = float(out.get("latency_s", 0.0))
+                preds[i] = {
+                    "qid": out["qid"],
+                    "question": out["question"],
+                    "answer": out["answer"],
+                    "query_dag": out["query_dag"],
+                    "selected_passages": out["selected_passages"],
+                    "retrieved_docs_top5": (out["retrieved_docs"] or [])[:5],
+                    "debug": out.get("debug") or {},
+                    "gen_meta": out.get("gen_meta") or {},
                 }
-            )
+                pbar.update(1)
+            pbar.close()
+        else:
+            pbar = tqdm(total=n, desc="RAG_QA", disable=False, ascii=True, dynamic_ncols=True)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {
+                    ex.submit(_run_one, i, qid, q): i
+                    for i, (qid, q) in enumerate(zip(qids, queries))
+                }
+                for fut in as_completed(futs):
+                    out = fut.result()
+                    i = int(out["i"])
+                    predicted_answers[i] = out["answer"]
+                    retrieved_docs_all[i] = list(out["retrieved_docs"] or [])
+                    subq_cov_list[i] = float((out.get("debug") or {}).get("subq_coverage", 0.0))
+                    ev_tokens_list[i] = int((out.get("debug") or {}).get("evidence_tokens", 0))
+                    latency_list[i] = float(out.get("latency_s", 0.0))
+                    preds[i] = {
+                        "qid": out["qid"],
+                        "question": out["question"],
+                        "answer": out["answer"],
+                        "query_dag": out["query_dag"],
+                        "selected_passages": out["selected_passages"],
+                        "retrieved_docs_top5": (out["retrieved_docs"] or [])[:5],
+                        "debug": out.get("debug") or {},
+                        "gen_meta": out.get("gen_meta") or {},
+                    }
+                    pbar.update(1)
+            pbar.close()
+
+        # Tight sanity: ensure ordering arrays are filled.
+        predicted_answers_f: List[str] = [str(a or "") for a in predicted_answers]
+        retrieved_docs_all_f: List[List[str]] = [list(x or []) for x in retrieved_docs_all]
+        preds_f: List[Dict[str, Any]] = [p or {"qid": qids[i], "question": str(queries[i]), "answer": ""} for i, p in enumerate(preds)]
 
         with open(self.pred_path, "w", encoding="utf-8") as f:
-            json.dump(preds, f, ensure_ascii=False, indent=2)
+            json.dump(preds_f, f, ensure_ascii=False, indent=2)
         logger.info(f"[StructAlignRAG] [RAG_QA] predictions written | {self.pred_path}")
 
         # Metrics
-        qa_metrics = qa_em_f1(gold_answers=gold_answers, predicted_answers=predicted_answers)
+        qa_metrics = qa_em_f1(gold_answers=gold_answers, predicted_answers=predicted_answers_f)
         retrieval_metrics = retrieval_recall(
             gold_docs=gold_docs,
-            retrieved_docs=retrieved_docs_all,
+            retrieved_docs=retrieved_docs_all_f,
             k_list=[1, 2, 5, 10, 20, 30, 50, 100, 150, 200],
         )
         extra = extra_metrics(subq_coverages=subq_cov_list, evidence_tokens=ev_tokens_list, latencies_s=latency_list)
+
+        # Attach end-to-end run timing (measured in main) into the metrics record.
+        # This avoids a separate runtime log file and keeps HippoRAG-style per-run metadata together.
+        run_timing: Dict[str, float] = {}
+        if isinstance(run_timing_s, dict):
+            for k, v in run_timing_s.items():
+                try:
+                    run_timing[str(k)] = float(v)
+                except Exception:
+                    continue
+        run_timing["rag_qa"] = float(time.time() - t_qa0)
+        if ("init" in run_timing) and ("index" in run_timing):
+            run_timing["total"] = float(run_timing.get("init", 0.0) + run_timing.get("index", 0.0) + run_timing["rag_qa"])
+        # Keep a flattened view in extra_metrics for easy scanning.
+        extra = dict(extra or {})
+        extra["RunQAS"] = round(run_timing["rag_qa"], 4)
+        if "init" in run_timing:
+            extra["RunInitS"] = round(run_timing["init"], 4)
+        if "index" in run_timing:
+            extra["RunIndexS"] = round(run_timing["index"], 4)
+        if "total" in run_timing:
+            extra["RunTotalS"] = round(run_timing["total"], 4)
 
         metrics: Dict[str, Any] = {}
         metrics.update(qa_metrics)
@@ -199,6 +283,7 @@ class StructAlignRAG:
             "retrieval_metrics": retrieval_metrics if retrieval_metrics else None,
             "qa_metrics": qa_metrics,
             "extra_metrics": extra,
+            "run_timing_s": {k: round(v, 4) for k, v in run_timing.items()} if run_timing else None,
         }
 
         _maybe_rotate_legacy_metrics(self.metrics_log_path)

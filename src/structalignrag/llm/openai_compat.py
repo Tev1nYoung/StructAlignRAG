@@ -238,6 +238,13 @@ class CacheOpenAICompat:
             self._client_index += 1
             return client
 
+    def num_keys(self) -> int:
+        """
+        Return how many API keys are available for concurrent throughput.
+        When no explicit keys are configured, treat as a single-key client.
+        """
+        return len(self._client_pool) if self._client_pool else 1
+
     @cache_response
     @dynamic_retry_decorator
     def infer(self, messages: List[TextChatMessage], **kwargs) -> Tuple[str, Dict[str, Any]]:
@@ -262,4 +269,3 @@ class CacheOpenAICompat:
             "finish_reason": resp.choices[0].finish_reason,
         }
         return content, meta
-

@@ -293,8 +293,12 @@ class StructAlignRetriever:
             anchor_id = "q0" if "q0" not in used_ids else "q_orig"
             nodes = [{"id": anchor_id, "question": question, "depends_on": [], "operator": "other", "vars_in": [], "vars_out": [], "constraints": {}}] + list(raw_nodes)
 
-        # Precompute question emb for dense fill (passage-aggregated doc ranking).
-        q_emb = embedder.encode([question])[0]
+        # Embed once per query (question + all subQs) for speed and to avoid repeated GPU calls.
+        # This does not change embeddings (same model, same texts), only reduces overhead.
+        texts_to_embed = [question] + [str((n or {}).get("question") or question) for n in nodes]
+        q_subq_emb = embedder.encode(texts_to_embed)
+        q_emb = q_subq_emb[0]
+        subq_emb_rows = q_subq_emb[1:]
         p_sims = passage_emb @ q_emb
         dense_doc_score: Dict[int, float] = {}
         doc_best_passage_row: Dict[int, int] = {}
@@ -320,10 +324,10 @@ class StructAlignRetriever:
         group_subq_emb: Dict[str, np.ndarray] = {}
 
         # Build candidate groups
-        for n in nodes:
+        for ni, n in enumerate(nodes):
             gid = str(n.get("id") or "q")
             subq = str(n.get("question") or question)
-            subq_emb = embedder.encode([subq])[0]
+            subq_emb = subq_emb_rows[ni] if ni < len(subq_emb_rows) else q_emb
             group_subq_emb[gid] = subq_emb
             sims = canonical_capsule_emb @ subq_emb
             top_idx = _safe_topk(sims, min(self.config.subq_top_capsule, len(canonical_capsules)))
