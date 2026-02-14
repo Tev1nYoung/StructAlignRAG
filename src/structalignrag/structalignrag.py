@@ -28,6 +28,23 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _move_file_if_needed(src: str, dst: str) -> bool:
+    """
+    Best-effort atomic move (rename) used for output-layout migration.
+    Returns True when a move happened.
+    """
+    if not os.path.exists(src):
+        return False
+    if os.path.exists(dst):
+        return False
+    _ensure_dir(os.path.dirname(dst))
+    try:
+        os.replace(src, dst)
+        return True
+    except OSError:
+        return False
+
+
 def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
     _ensure_dir(os.path.dirname(path))
     with open(path, "a", encoding="utf-8") as f:
@@ -73,7 +90,21 @@ class StructAlignRAG:
         emb_tag = sanitize_model_name(config.embedding_model_name)
         # Match HippoRAG/HARE style: <llm_tag>_<emb_tag>
         self.meta_dir = os.path.join(config.save_dir(), f"{llm_tag}_{emb_tag}")
-        _ensure_dir(self.meta_dir)
+
+        # Output layout (3 categories):
+        # - reusable: offline artifacts (index)
+        # - non_reusable: caches / volatile run state
+        # - metrics: predictions + metrics logs
+        self.reusable_dir = os.path.join(self.meta_dir, "reusable")
+        self.non_reusable_dir = os.path.join(self.meta_dir, "non_reusable")
+        self.metrics_dir = os.path.join(self.meta_dir, "metrics")
+        _ensure_dir(self.reusable_dir)
+        _ensure_dir(self.non_reusable_dir)
+        _ensure_dir(self.metrics_dir)
+
+        # One-time migration from legacy flat layout (files directly under meta_dir).
+        # This avoids expensive re-indexing when users upgrade.
+        self._maybe_migrate_legacy_outputs(llm_tag=llm_tag)
 
         logger.info(
             f"[StructAlignRAG] initialized | dataset={config.dataset} llm={config.llm_name} emb={config.embedding_model_name}"
@@ -92,7 +123,7 @@ class StructAlignRAG:
         if config.llm_base_url and "localhost" in config.llm_base_url and os.getenv("OPENAI_API_KEY") is None:
             os.environ["OPENAI_API_KEY"] = "sk-"
 
-        cache_dir = os.path.join(config.save_dir(), "llm_cache")
+        cache_dir = os.path.join(self.non_reusable_dir, "llm_cache")
         self.llm = CacheOpenAICompat(
             cache_dir=cache_dir,
             llm_name=config.llm_name,
@@ -104,13 +135,87 @@ class StructAlignRAG:
         )
 
         # Pipeline parts
-        self.indexer = OfflineIndexer(config=config, meta_dir=self.meta_dir)
+        self.indexer = OfflineIndexer(config=config, meta_dir=self.reusable_dir)
         self.retriever = StructAlignRetriever(config=config)
         self.generator = AnswerGenerator(config=config, llm=self.llm)
 
         # Outputs
-        self.metrics_log_path = os.path.join(self.meta_dir, "metrics_log.jsonl")
-        self.pred_path = os.path.join(self.meta_dir, "qa_predictions.json")
+        self.metrics_log_path = os.path.join(self.metrics_dir, "metrics_log.jsonl")
+        self.pred_path = os.path.join(self.metrics_dir, "qa_predictions.json")
+
+    def _maybe_migrate_legacy_outputs(self, llm_tag: str) -> None:
+        """
+        Migrate from legacy "flat" meta_dir layout to the 3-folder layout.
+
+        Legacy (pre-refactor):
+          meta_dir/<offline artifacts + qa_predictions.json + metrics_log.jsonl>
+          outputs/<dataset>/llm_cache/llm_cache_<llm>.sqlite
+
+        New:
+          meta_dir/reusable/<offline artifacts>
+          meta_dir/non_reusable/llm_cache/<llm cache sqlite>
+          meta_dir/metrics/<qa_predictions + metrics_log>
+        """
+        # 1) Offline artifacts -> reusable/
+        legacy_index_meta = os.path.join(self.meta_dir, "index_meta.json")
+        new_index_meta = os.path.join(self.reusable_dir, "index_meta.json")
+        offline_files = [
+            "docs.jsonl",
+            "passages.jsonl",
+            "entities.jsonl",
+            "capsules.jsonl",
+            "canonical_capsules.jsonl",
+            "capsule_to_canonical.jsonl",
+            "doc_embeddings.npy",
+            "passage_embeddings.npy",
+            "capsule_embeddings.npy",
+            "canonical_capsule_embeddings.npy",
+            "faiss_passages.index",
+            "faiss_passage_ids.json",
+            "faiss_capsules.index",
+            "faiss_capsule_ids.json",
+            "graph_edges.jsonl",
+            "graph_adj.pkl",
+            "struct_index.pkl",
+            "entity_alias_to_id.json",
+            "offline_stats.json",
+            "index_meta.json",
+        ]
+        if os.path.exists(legacy_index_meta) and (not os.path.exists(new_index_meta)):
+            moved = 0
+            for fn in offline_files:
+                src = os.path.join(self.meta_dir, fn)
+                dst = os.path.join(self.reusable_dir, fn)
+                if _move_file_if_needed(src, dst):
+                    moved += 1
+            if moved:
+                logger.info(f"[StructAlignRAG] migrated legacy offline artifacts -> reusable/ | moved_files={moved}")
+
+        # 2) QA outputs -> metrics/
+        for fn in ["metrics_log.jsonl", "qa_predictions.json"]:
+            src = os.path.join(self.meta_dir, fn)
+            dst = os.path.join(self.metrics_dir, fn)
+            if _move_file_if_needed(src, dst):
+                logger.info(f"[StructAlignRAG] migrated legacy QA output -> metrics/ | file={fn}")
+
+        # 3) LLM cache -> non_reusable/llm_cache/
+        legacy_cache_dir = os.path.join(self.config.save_dir(), "llm_cache")
+        legacy_cache_file = os.path.join(legacy_cache_dir, f"llm_cache_{self.config.llm_name.replace('/', '_')}.sqlite")
+        legacy_lock_file = legacy_cache_file + ".lock"
+        new_cache_dir = os.path.join(self.non_reusable_dir, "llm_cache")
+        new_cache_file = os.path.join(new_cache_dir, os.path.basename(legacy_cache_file))
+        new_lock_file = new_cache_file + ".lock"
+
+        if _move_file_if_needed(legacy_cache_file, new_cache_file):
+            logger.info(f"[StructAlignRAG] migrated legacy llm_cache sqlite -> non_reusable/llm_cache/ | llm={llm_tag}")
+        _move_file_if_needed(legacy_lock_file, new_lock_file)
+
+        # Optional: cleanup empty legacy cache dir (best effort).
+        try:
+            if os.path.isdir(legacy_cache_dir) and not os.listdir(legacy_cache_dir):
+                os.rmdir(legacy_cache_dir)
+        except OSError:
+            pass
 
     def index(self, corpus: List[Dict[str, Any]]) -> Dict[str, Any]:
         return self.indexer.build_or_load(corpus=corpus, embedder=self.embedder, llm=self.llm)

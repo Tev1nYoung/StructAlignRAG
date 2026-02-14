@@ -55,6 +55,24 @@ def main() -> None:
     parser.add_argument("--enable_genericness_penalty", type=str, default=None, help="Enable genericness penalty: true|false")
     parser.add_argument("--genericness_penalty_weight", type=float, default=None, help="Genericness penalty weight (subtract w*scaled(g))")
     parser.add_argument("--genericness_penalty_threshold", type=float, default=None, help="Only penalize docs with genericness >= threshold")
+    parser.add_argument(
+        "--enable_global_evidence_selection",
+        type=str,
+        default=None,
+        help="Enable global evidence selection (coverage-aware passage packing): true|false",
+    )
+    parser.add_argument(
+        "--enable_local_propagation",
+        type=str,
+        default=None,
+        help="Enable local propagation (mini-PPR on induced subgraph): true|false",
+    )
+    parser.add_argument(
+        "--subq_coverage_top_m",
+        type=int,
+        default=None,
+        help="SubQCoverage@M: M for evidence coverage (top-M capsules per group)",
+    )
     parser.add_argument("--max_queries", type=int, default=None, help="Optional cap on number of queries")
     parser.add_argument("--query_offset", type=int, default=0, help="Optional starting offset")
     parser.add_argument("--shuffle_seed", type=int, default=None, help="Optional deterministic shuffle seed")
@@ -124,6 +142,12 @@ def main() -> None:
         cfg.genericness_penalty_weight = float(args.genericness_penalty_weight)
     if args.genericness_penalty_threshold is not None:
         cfg.genericness_penalty_threshold = float(args.genericness_penalty_threshold)
+    if args.enable_global_evidence_selection is not None:
+        cfg.enable_global_evidence_selection = _parse_bool(args.enable_global_evidence_selection)
+    if args.enable_local_propagation is not None:
+        cfg.enable_local_propagation = _parse_bool(args.enable_local_propagation)
+    if args.subq_coverage_top_m is not None:
+        cfg.subq_coverage_top_m = int(args.subq_coverage_top_m)
 
     t0 = time.time()
     rag = StructAlignRAG(cfg)

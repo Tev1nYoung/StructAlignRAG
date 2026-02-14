@@ -15,6 +15,8 @@ from ..config import StructAlignRAGConfig
 from ..utils.logging_utils import get_logger
 from ..utils.text_utils import extract_entity_mentions, normalize_entity
 from ..utils.genericness_utils import title_genericness_score
+from .evidence_selector import greedy_select_evidence_passages
+from .propagation import run_local_propagation_rrf
 
 logger = get_logger(__name__)
 
@@ -245,6 +247,11 @@ class StructAlignRetriever:
         generic_skip_th = float(getattr(self.config, "genericness_skip_threshold", 0.85))
 
         passage_id_to_passage = {p["passage_id"]: p for p in passages}
+        pid_to_row: Dict[str, int] = {}
+        for i, p in enumerate(passages):
+            pid = str(p.get("passage_id") or "")
+            if pid:
+                pid_to_row.setdefault(pid, int(i))
         can_id_to_cap = {c["canonical_id"]: c for c in canonical_capsules}
         cap_node_to_entset: Dict[str, Set[str]] = {}
         cap_node_to_docset: Dict[str, Set[int]] = {}
@@ -300,6 +307,8 @@ class StructAlignRetriever:
         q_emb = q_subq_emb[0]
         subq_emb_rows = q_subq_emb[1:]
         p_sims = passage_emb @ q_emb
+        # Used for global evidence selection: max similarity over (question + all subQs).
+        passage_sim_max = np.array(p_sims, copy=True)
         dense_doc_score: Dict[int, float] = {}
         doc_best_passage_row: Dict[int, int] = {}
         doc_best_passage_sim: Dict[int, float] = {}
@@ -381,6 +390,11 @@ class StructAlignRetriever:
                 sims_g = passage_emb @ emb
             except Exception:
                 continue
+            # Track max similarity over query variants for evidence packing.
+            try:
+                passage_sim_max = np.maximum(passage_sim_max, sims_g)
+            except Exception:
+                pass
             doc_score_g: Dict[int, float] = {}
             doc_best_row_g: Dict[int, int] = {}
             for i, p in enumerate(passages):
@@ -408,6 +422,53 @@ class StructAlignRetriever:
         for rlist in rank_lists:
             for r, d in enumerate(rlist[: max(1, rrf_pool)]):
                 rrf_scores[int(d)] += 1.0 / float(rrf_k + r + 1)
+
+        # Optional: local propagation (mini-PPR) to let the evidence graph influence capsule/doc ranking.
+        ppr_out: Dict[str, Any] | None = None
+        try:
+            if bool(getattr(self.config, "enable_local_propagation", False)) and len(group_candidates) >= int(getattr(self.config, "ppr_min_groups", 2) or 2):
+                seed_per_group = max(1, int(getattr(self.config, "ppr_seed_per_group", 4) or 4))
+                seed_caps: List[str] = []
+                for g in group_candidates:
+                    for x in (g.get("candidates") or [])[:seed_per_group]:
+                        nid = str((x or {}).get("node_id") or "")
+                        if nid:
+                            seed_caps.append(nid)
+                # Entity seeds: parse mentions from question + subQs.
+                ent_ids: Set[str] = set()
+                for txt in [question] + [str(g.get("subq") or "") for g in group_candidates]:
+                    for m in extract_entity_mentions(txt):
+                        norm = normalize_entity(m)
+                        if norm in ent_norm_to_id:
+                            ent_ids.add(str(ent_norm_to_id[norm]))
+                seed_entities = [f"E:{eid}" for eid in sorted(ent_ids)]
+
+                ppr_out = run_local_propagation_rrf(adj=adj, seed_capsules=seed_caps, seed_entities=seed_entities, config=self.config)
+
+                if ppr_out and bool(ppr_out.get("enabled")):
+                    capsule_rrf: Dict[str, float] = dict(ppr_out.get("capsule_rrf") or {})
+                    ppr_w = float(getattr(self.config, "ppr_prize_weight", 0.0) or 0.0)
+                    if capsule_rrf and ppr_w != 0.0:
+                        for g in group_candidates:
+                            gid = str(g.get("group_id") or "")
+                            pm = group_prize_maps.get(gid) or {}
+                            for c in g.get("candidates") or []:
+                                nid = str(c.get("node_id") or "")
+                                if not nid:
+                                    continue
+                                rrf = float(capsule_rrf.get(nid, 0.0))
+                                if rrf <= 0.0:
+                                    continue
+                                bonus = ppr_w * rrf
+                                new_prize = float(c.get("prize") or 0.0) + float(bonus)
+                                c["prize"] = float(new_prize)
+                                c["ppr_rrf"] = float(rrf)
+                                pm[nid] = float(new_prize)
+                            # Resort after updating prizes.
+                            g["candidates"] = sorted(g.get("candidates") or [], key=lambda x: float(x.get("prize") or 0.0), reverse=True)
+                            group_prize_maps[gid] = pm
+        except Exception as e:
+            logger.debug(f"[StructAlignRAG] [PPR] skipped | err={type(e).__name__}: {e}")
 
         # DAG-aware binding assignment (zero-shot variable binding via entity overlap).
         parents = _build_parent_map(query_dag, set(node_ids))
@@ -577,18 +638,11 @@ class StructAlignRetriever:
                 for u in path:
                     selected.add(u)
 
-        # Coverage: any group has at least one selected candidate
-        covered = 0
-        for g in group_candidates:
-            gid = g["group_id"]
-            ok = False
-            for x in g["candidates"][: self.config.seed_top_s]:
-                if x["node_id"] in selected:
-                    ok = True
-                    break
-            if ok:
-                covered += 1
-        subq_coverage = covered / max(len(group_candidates), 1)
+        # SubQCoverage is computed AFTER final evidence selection (coverage in chosen passages),
+        # not from the internal selected-node set (which includes many seeds by design).
+        subq_coverage = 0.0
+        covered_groups: List[str] = []
+        group_best_prize_in_evidence: Dict[str, float] = {}
 
         # Score docs based on selected capsules prizes
         doc_score: Dict[int, float] = {}
@@ -625,6 +679,24 @@ class StructAlignRetriever:
         if rrf_w > 0.0 and rrf_scores:
             for d, s in rrf_scores.items():
                 doc_score[int(d)] = float(doc_score.get(int(d), 0.0)) + rrf_w * float(s)
+
+        # Local propagation doc boost (RRF over PPR scores). Uses ranks (not raw scores) for robustness.
+        try:
+            ppr_doc_w = float(getattr(self.config, "ppr_doc_weight", 0.0) or 0.0)
+            if ppr_out and bool(ppr_out.get("enabled")) and ppr_doc_w != 0.0:
+                doc_rrf_nodes = ppr_out.get("doc_rrf_nodes") or {}
+                if isinstance(doc_rrf_nodes, dict):
+                    for node, rrf in doc_rrf_nodes.items():
+                        node = str(node)
+                        if not node.startswith("D:"):
+                            continue
+                        try:
+                            didx = int(node.split(":", 1)[1])
+                        except Exception:
+                            continue
+                        doc_score[didx] = float(doc_score.get(didx, 0.0)) + ppr_doc_w * float(rrf)
+        except Exception as e:
+            logger.debug(f"[StructAlignRAG] [PPR] doc boost skipped | err={type(e).__name__}: {e}")
 
         # Entity-jump: if an entity mentioned in high-prize capsules matches a doc title in the corpus,
         # boost that doc. This is a cheap zero-shot way to recover second-hop pages.
@@ -890,48 +962,162 @@ class StructAlignRetriever:
             if len(retrieved_docs) >= min(self.config.retrieval_top_k, len(docs)):
                 break
 
-        # Select passages for QA: primarily use passages from the top-ranked docs.
-        # This keeps QA grounded to the same objects used in Recall@k and helps 2-hop questions
-        # where the second-hop doc may have low similarity to the original question.
+        # Select passages for QA: global evidence packing (coverage-aware) if struct_index is available.
         chosen_passages: List[Dict[str, Any]] = []
         chosen_pids: Set[str] = set()
         total_tokens = 0
+        evidence_dbg: Dict[str, Any] = {"method": "per_doc_best"}
 
-        for d in struct_docs_rank:
-            if len(chosen_passages) >= self.config.qa_top_k_passages:
-                break
-            d = int(d)
-            # Pick the best passage from this doc across *any* query variant (original question + subQs).
-            row = doc_best_passage_row.get(d)
-            best_sim = float(doc_best_passage_sim.get(d, -1e18))
-            for gid in node_ids:
-                row_g = (group_doc_best_passage_row.get(gid) or {}).get(d)
-                sim_g = (group_doc_best_passage_sim.get(gid) or {}).get(d)
-                if row_g is None or sim_g is None:
+        struct_index = index.get("struct_index") or {}
+        passage_to_cc = None
+        doc_to_passages = None
+        if isinstance(struct_index, dict):
+            passage_to_cc = struct_index.get("passage_to_canonical_capsules")
+            doc_to_passages = struct_index.get("doc_to_passages")
+
+        use_global = bool(getattr(self.config, "enable_global_evidence_selection", False)) and isinstance(passage_to_cc, dict) and isinstance(doc_to_passages, dict)
+
+        if use_global:
+            # Build candidate pool: top docs + selected capsule provenance + global dense + (optional) PPR passages.
+            cand_pids: Set[str] = set()
+            pool_counts = {"top_docs": 0, "provenance": 0, "global_dense": 0, "ppr": 0}
+
+            pool_doc_n = max(1, int(getattr(self.config, "evidence_pool_doc_n", 50) or 50))
+            per_doc_m = max(1, int(getattr(self.config, "evidence_pool_passages_per_doc", 4) or 4))
+            for d in struct_docs_rank[:pool_doc_n]:
+                try:
+                    pids = (doc_to_passages or {}).get(int(d)) or []
+                except Exception:
+                    pids = []
+                scored: List[Tuple[float, str]] = []
+                for pid in pids:
+                    pid = str(pid)
+                    row = pid_to_row.get(pid)
+                    if row is None:
+                        continue
+                    try:
+                        scored.append((float(passage_sim_max[int(row)]), pid))
+                    except Exception:
+                        scored.append((0.0, pid))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                for _s, pid in scored[:per_doc_m]:
+                    if pid not in cand_pids:
+                        cand_pids.add(pid)
+                        pool_counts["top_docs"] += 1
+
+            # Selected capsule provenance passages.
+            for cap_node in [n for n in selected if str(n).startswith("C:")]:
+                can_id = str(cap_node).split(":", 1)[1]
+                cap = can_id_to_cap.get(can_id)
+                if not cap:
                     continue
-                if float(sim_g) > best_sim:
-                    best_sim = float(sim_g)
-                    row = int(row_g)
+                for prov in cap.get("provenance") or []:
+                    pid = str((prov or {}).get("passage_id") or "")
+                    if pid and pid not in cand_pids:
+                        cand_pids.add(pid)
+                        pool_counts["provenance"] += 1
 
-            if row is None:
-                continue
-            p = passages[int(row)]
-            pid = str(p.get("passage_id") or "")
-            if not pid or pid in chosen_pids:
-                continue
-            toks = int(p.get("token_count") or _approx_tokens(p.get("text", "")))
-            if total_tokens + toks > self.config.passage_token_budget:
-                continue
-            chosen_passages.append(p)
-            chosen_pids.add(pid)
-            total_tokens += toks
+            # Global dense pool for the original question (q_emb).
+            pool_dense_n = max(1, int(getattr(self.config, "evidence_pool_global_dense_n", 120) or 120))
+            top_rows = _safe_topk(p_sims, min(pool_dense_n, len(passages))).tolist()
+            for row in top_rows:
+                p = passages[int(row)]
+                pid = str(p.get("passage_id") or "")
+                if pid and pid not in cand_pids:
+                    cand_pids.add(pid)
+                    pool_counts["global_dense"] += 1
 
-        # Fallback: dense top passages for the original question.
+            # Optional: add top PPR passages to the pool.
+            if (
+                ppr_out
+                and bool(ppr_out.get("enabled"))
+                and bool(getattr(self.config, "evidence_pool_add_ppr_passages", True))
+            ):
+                lim = max(0, int(getattr(self.config, "evidence_pool_ppr_passage_n", 50) or 50))
+                for pid in (ppr_out.get("top_passage_ids") or [])[:lim]:
+                    pid = str(pid)
+                    if pid and pid not in cand_pids:
+                        cand_pids.add(pid)
+                        pool_counts["ppr"] += 1
+
+            # Seed evidence with best passages from the top docs (keeps evidence answer-oriented).
+            seed_pids: List[str] = []
+            try:
+                ensure_docs = max(0, int(getattr(self.config, "qa_ensure_top_docs", 0) or 0))
+            except Exception:
+                ensure_docs = 0
+            if ensure_docs > 0:
+                for d in struct_docs_rank[: min(ensure_docs, len(struct_docs_rank))]:
+                    d = int(d)
+                    row = doc_best_passage_row.get(d)
+                    best_sim = float(doc_best_passage_sim.get(d, -1e18))
+                    for gid in node_ids:
+                        row_g = (group_doc_best_passage_row.get(gid) or {}).get(d)
+                        sim_g = (group_doc_best_passage_sim.get(gid) or {}).get(d)
+                        if row_g is None or sim_g is None:
+                            continue
+                        if float(sim_g) > best_sim:
+                            best_sim = float(sim_g)
+                            row = int(row_g)
+                    if row is None:
+                        continue
+                    pid = str((passages[int(row)] or {}).get("passage_id") or "")
+                    if pid:
+                        seed_pids.append(pid)
+
+            # Evidence gain weighting: emphasize DAG leaves (often the final-hop question) when DAG edges exist.
+            group_weights: Dict[str, float] = {str(gid): 1.0 for gid in node_ids}
+            try:
+                has_edges = any((parents.get(gid) or set()) for gid in node_ids)
+                if has_edges:
+                    parent_ids: Set[str] = set()
+                    for child, ps in parents.items():
+                        for p in (ps or set()):
+                            parent_ids.add(str(p))
+                    leaves = set(str(g) for g in node_ids) - set(parent_ids)
+                    for gid in leaves:
+                        group_weights[str(gid)] = 2.0
+            except Exception:
+                pass
+
+            chosen_passages, sel_dbg = greedy_select_evidence_passages(
+                config=self.config,
+                passages=passages,
+                pid_to_row=pid_to_row,
+                candidate_pids=cand_pids,
+                passage_sim_max=passage_sim_max,
+                passage_sim_anchor=p_sims,
+                passage_to_canonical_capsules=passage_to_cc,
+                group_prize_maps=group_prize_maps,
+                group_ids=node_ids,
+                seed_pids=seed_pids,
+                group_weights=group_weights,
+            )
+            chosen_pids = set(str(p.get("passage_id") or "") for p in chosen_passages if p.get("passage_id"))
+            total_tokens = int(sel_dbg.get("selected_tokens") or 0)
+            evidence_dbg = {"method": "global_greedy", "pool_counts": pool_counts}
+            evidence_dbg.update(sel_dbg or {})
+
+        # Fallback: old per-doc best-passage strategy (kept for backward-compat / ablations).
         if not chosen_passages:
-            top_p_rows = _safe_topk(p_sims, min(self.config.qa_top_k_passages * 50, len(passages))).tolist()
-            for row in top_p_rows:
+            for d in struct_docs_rank:
                 if len(chosen_passages) >= self.config.qa_top_k_passages:
                     break
+                d = int(d)
+                # Pick the best passage from this doc across *any* query variant (original question + subQs).
+                row = doc_best_passage_row.get(d)
+                best_sim = float(doc_best_passage_sim.get(d, -1e18))
+                for gid in node_ids:
+                    row_g = (group_doc_best_passage_row.get(gid) or {}).get(d)
+                    sim_g = (group_doc_best_passage_sim.get(gid) or {}).get(d)
+                    if row_g is None or sim_g is None:
+                        continue
+                    if float(sim_g) > best_sim:
+                        best_sim = float(sim_g)
+                        row = int(row_g)
+
+                if row is None:
+                    continue
                 p = passages[int(row)]
                 pid = str(p.get("passage_id") or "")
                 if not pid or pid in chosen_pids:
@@ -943,12 +1129,60 @@ class StructAlignRetriever:
                 chosen_pids.add(pid)
                 total_tokens += toks
 
+            # Final fallback: dense top passages for the original question.
+            if not chosen_passages:
+                top_p_rows = _safe_topk(p_sims, min(self.config.qa_top_k_passages * 50, len(passages))).tolist()
+                for row in top_p_rows:
+                    if len(chosen_passages) >= self.config.qa_top_k_passages:
+                        break
+                    p = passages[int(row)]
+                    pid = str(p.get("passage_id") or "")
+                    if not pid or pid in chosen_pids:
+                        continue
+                    toks = int(p.get("token_count") or _approx_tokens(p.get("text", "")))
+                    if total_tokens + toks > self.config.passage_token_budget:
+                        continue
+                    chosen_passages.append(p)
+                    chosen_pids.add(pid)
+                    total_tokens += toks
+
+        # SubQCoverage@M: compute coverage of top-M capsules per group inside the final evidence passages.
+        subq_top_m = max(1, int(getattr(self.config, "subq_coverage_top_m", 5) or 5))
+        if isinstance(passage_to_cc, dict) and chosen_passages:
+            evidence_cap_nodes: Set[str] = set()
+            for p in chosen_passages:
+                pid = str(p.get("passage_id") or "")
+                for ccid in (passage_to_cc.get(pid) or []):
+                    evidence_cap_nodes.add(f"C:{ccid}")
+
+            covered_groups = []
+            group_best_prize_in_evidence = {}
+            for g in group_candidates:
+                gid = str(g.get("group_id") or "")
+                top_nodes = [str(x.get("node_id") or "") for x in (g.get("candidates") or [])[:subq_top_m] if str(x.get("node_id") or "")]
+                best = 0.0
+                ok = False
+                pm = group_prize_maps.get(gid) or {}
+                for nid in top_nodes:
+                    if nid in evidence_cap_nodes:
+                        ok = True
+                        best = max(best, float(pm.get(nid, 0.0)))
+                if ok:
+                    covered_groups.append(gid)
+                group_best_prize_in_evidence[gid] = float(best)
+
+            subq_coverage = float(len(covered_groups)) / float(max(len(group_candidates), 1))
+
         debug = {
             "subq_coverage": subq_coverage,
+            "subq_coverage_top_m": subq_top_m,
+            "covered_groups": covered_groups,
+            "group_best_prize_in_evidence": group_best_prize_in_evidence,
             "selected_nodes": sorted(selected),
             "selected_docs": struct_docs_rank,
             "selected_passages": [p.get("passage_id") for p in chosen_passages],
             "evidence_tokens": total_tokens,
+            "evidence_selection": evidence_dbg,
             "elapsed_s": round(time.time() - t0, 4),
             "num_groups": len(group_candidates),
             "root": root,
@@ -957,6 +1191,16 @@ class StructAlignRetriever:
             "binding_parents": {k: sorted(list(v)) for k, v in parents.items()},
             "binding_assignment": chosen,
         }
+
+        if ppr_out and bool(ppr_out.get("enabled")):
+            debug["ppr_enabled"] = True
+            debug["ppr_num_nodes"] = int(ppr_out.get("num_nodes") or 0)
+            debug["ppr_seed_capsules"] = list(ppr_out.get("seed_capsules") or [])
+            debug["ppr_seed_entities"] = list(ppr_out.get("seed_entities") or [])
+            debug["ppr_top_docs"] = list(ppr_out.get("top_docs") or [])
+            debug["ppr_top_capsules"] = list(ppr_out.get("top_capsules") or [])
+        else:
+            debug["ppr_enabled"] = False
 
         return RetrievalResult(
             retrieved_docs=retrieved_docs,

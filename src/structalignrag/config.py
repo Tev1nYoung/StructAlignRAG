@@ -66,6 +66,27 @@ class StructAlignRAGConfig:
     induced_max_nodes: int = 6000
     neighbor_expand_sim_top_m: int = 0  # MVP: 0 disables sim expansion
 
+    # Online: local propagation (mini-PPR on induced subgraph)
+    enable_local_propagation: bool = True
+    ppr_min_groups: int = 2
+    ppr_seed_per_group: int = 4
+    ppr_hops: int = 2
+    ppr_max_nodes: int = 5000
+    ppr_steps: int = 10
+    ppr_alpha: float = 0.85
+    ppr_rrf_k: int = 60
+    ppr_rrf_pool: int = 200
+    ppr_prize_weight: float = 2.0
+    ppr_doc_weight: float = 5.0
+    ppr_allow_sim_edges: bool = False
+    ppr_strength_mentions: float = 1.0
+    ppr_strength_in_passage: float = 1.0
+    ppr_strength_in_doc: float = 0.7
+    ppr_strength_entails: float = 0.5
+    ppr_strength_contradicts: float = 0.0
+    ppr_strength_sim: float = 0.2
+    ppr_eps: float = 1e-6
+
     # Online: structure-aligned selection (binding/assignment)
     binding_candidate_k: int = 12  # per subQ, how many candidates to consider for binding
     binding_beam_size: int = 24  # beam size for DAG-consistent assignment
@@ -110,6 +131,19 @@ class StructAlignRAGConfig:
     qa_top_k_passages: int = 5  # number of passages fed to LLM (match HippoRAG default)
     qa_ensure_top_docs: int = 2  # ensure evidence includes at least this many top-ranked docs (if available)
     passage_token_budget: int = 1800
+
+    # Online: global evidence selection (coverage-aware passage packing)
+    enable_global_evidence_selection: bool = True
+    evidence_pool_doc_n: int = 50
+    evidence_pool_passages_per_doc: int = 4
+    evidence_pool_global_dense_n: int = 120
+    evidence_pool_add_ppr_passages: bool = True
+    evidence_pool_ppr_passage_n: int = 50
+    evidence_dense_w: float = 0.25
+    evidence_gain_w: float = 0.75
+    evidence_same_doc_penalty: float = 0.10
+    evidence_len_penalty: float = 0.0
+    subq_coverage_top_m: int = 5
 
     # GCP parameters
     seed_top_s: int = 6
