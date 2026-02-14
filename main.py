@@ -29,6 +29,9 @@ def main() -> None:
     parser.add_argument("--llm_base_url", type=str, default=DEFAULT_LLM_BASE_URL, help="LLM base URL")
     parser.add_argument("--llm_name", type=str, default=DEFAULT_LLM_NAME, help="LLM model name")
     parser.add_argument("--embedding_name", type=str, default=DEFAULT_EMB_NAME, help="Embedding model name")
+    parser.add_argument("--embedding_batch_size", type=int, default=None, help="Embedding batch size override")
+    parser.add_argument("--embedding_max_seq_len", type=int, default=None, help="Embedding max sequence length override")
+    parser.add_argument("--embedding_dtype", type=str, default=None, help="Embedding dtype override: auto|float16|bfloat16|float32")
     parser.add_argument(
         "--embedding_query_instruction",
         type=str,
@@ -87,6 +90,12 @@ def main() -> None:
         embedding_model_name=args.embedding_name,
         force_index_from_scratch=_parse_bool(args.force_index_from_scratch),
     )
+    if args.embedding_batch_size is not None:
+        cfg.embedding_batch_size = int(args.embedding_batch_size)
+    if args.embedding_max_seq_len is not None:
+        cfg.embedding_max_seq_len = int(args.embedding_max_seq_len)
+    if args.embedding_dtype is not None:
+        cfg.embedding_dtype = str(args.embedding_dtype)
     if args.embedding_query_instruction is not None:
         cfg.embedding_query_instruction = str(args.embedding_query_instruction)
     if args.capsule_mode is not None:
