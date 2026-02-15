@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -390,6 +392,20 @@ class StructAlignRAG:
             "extra_metrics": extra,
             "run_timing_s": {k: round(v, 4) for k, v in run_timing.items()} if run_timing else None,
         }
+
+        # For reproducibility: store the exact CLI used for this run.
+        # Use Windows-friendly quoting so the command can be copy-pasted.
+        try:
+            exe = str(sys.executable or "python")
+            argv = [str(x) for x in (sys.argv or [])]
+            record["cli"] = {
+                "executable": exe,
+                "argv": argv,
+                "cwd": os.getcwd(),
+                "command": subprocess.list2cmdline([exe] + argv),
+            }
+        except Exception:
+            record["cli"] = {"executable": None, "argv": None, "cwd": None, "command": None}
 
         _maybe_rotate_legacy_metrics(self.metrics_log_path)
         _append_hipporag_style_metrics(self.metrics_log_path, record)
