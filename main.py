@@ -50,8 +50,11 @@ def main() -> None:
     parser.add_argument("--nli_llm_workers", type=int, default=None, help="Offline NLI LLM workers (if enabled)")
     parser.add_argument("--offline_store_llm_meta", type=str, default=None, help="Store per-call llm_meta into capsules: true|false")
     # Online ablations (for paper-quality experiments)
+    parser.add_argument("--enable_query_dag", type=str, default=None, help="Enable query DAG decomposition: true|false")
     parser.add_argument("--enable_llm_doc_rerank", type=str, default=None, help="Enable LLM doc rerank: true|false")
     parser.add_argument("--enable_doc_mention_jump", type=str, default=None, help="Enable doc-mention jump: true|false")
+    parser.add_argument("--entity_jump_top_m", type=int, default=None, help="Entity jump: top-M entities to try (0 disables)")
+    parser.add_argument("--entity_jump_bonus", type=float, default=None, help="Entity jump: bonus scale (0 disables)")
     parser.add_argument("--enable_genericness_penalty", type=str, default=None, help="Enable genericness penalty: true|false")
     parser.add_argument("--genericness_penalty_weight", type=float, default=None, help="Genericness penalty weight (subtract w*scaled(g))")
     parser.add_argument("--genericness_penalty_threshold", type=float, default=None, help="Only penalize docs with genericness >= threshold")
@@ -132,10 +135,16 @@ def main() -> None:
         cfg.nli_llm_workers = int(args.nli_llm_workers)
     if args.offline_store_llm_meta is not None:
         cfg.offline_store_llm_meta = _parse_bool(args.offline_store_llm_meta)
+    if args.enable_query_dag is not None:
+        cfg.enable_query_dag = _parse_bool(args.enable_query_dag)
     if args.enable_llm_doc_rerank is not None:
         cfg.enable_llm_doc_rerank = _parse_bool(args.enable_llm_doc_rerank)
     if args.enable_doc_mention_jump is not None:
         cfg.enable_doc_mention_jump = _parse_bool(args.enable_doc_mention_jump)
+    if args.entity_jump_top_m is not None:
+        cfg.entity_jump_top_m = int(args.entity_jump_top_m)
+    if args.entity_jump_bonus is not None:
+        cfg.entity_jump_bonus = float(args.entity_jump_bonus)
     if args.enable_genericness_penalty is not None:
         cfg.enable_genericness_penalty = _parse_bool(args.enable_genericness_penalty)
     if args.genericness_penalty_weight is not None:
